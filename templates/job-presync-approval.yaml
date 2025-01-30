@@ -92,7 +92,7 @@ spec:
                   sys.exit(1)
 
               client = WebClient(token=SLACK_BOT_TOKEN)
-              channel_name = "#argocd"
+              channel_name = "#argo-cd"
 
               try:
                   response = client.chat_postMessage(
