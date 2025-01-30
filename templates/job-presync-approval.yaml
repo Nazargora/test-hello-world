@@ -1,0 +1,218 @@
+{{- if .Values.argocd.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: presync-approval-job
+  namespace: argocd
+  labels:
+    app: presync-approval
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: local-tmp
+          hostPath:
+            path: /tmp/presync
+      containers:
+        - name: wait-for-approval
+          image:  gora04/mini-deb:v1
+          volumeMounts:
+            - name: local-tmp
+              mountPath: /tmp/presync
+          env:
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: slack-token-secret
+                  key: SLACK_BOT_TOKEN
+            - name: ARGOCD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-password
+                  key: ARGOCD_PASSWORD
+            - name: APP_NAME
+              value: "my-test-app"
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "=========================="
+              echo "PreSync Job: Using custom image with dependencies!"
+              echo "=========================="
+
+              source /opt/venv/bin/activate  
+
+              echo "Logging in to Argo CD server..."
+              argocd login argocd-stone.demoapps.win \
+                --username test \
+                --password "$ARGOCD_PASSWORD" \
+                --insecure \
+                --grpc-web
+
+              mkdir -p "/tmp/presync/$APP_NAME"
+
+              SIGNAL_FILE="/tmp/presync/$APP_NAME/approval_signal"
+              EMAILS_FILE="/tmp/presync/$APP_NAME/approved_emails"
+              MSG_METADATA="/tmp/presync/$APP_NAME/msg_metadata"
+              export SIGNAL_FILE
+              export EMAILS_FILE
+              export MSG_METADATA
+
+              if [ -z "$MSG_METADATA" ]; then
+                echo "[ERROR] MSG_METADATA environment variable is not set!"
+                exit 1
+              fi
+
+              echo "[INFO] SIGNAL_FILE => $SIGNAL_FILE"
+              echo "[INFO] EMAILS_FILE => $EMAILS_FILE"
+              echo "[INFO] MSG_METADATA => $MSG_METADATA"
+
+              DIFF=$(argocd app diff "$APP_NAME" --refresh --exit-code=false || true)
+              echo "[INFO] DIFF output:"
+              echo "$DIFF"
+              export DIFF_CONTENT="$DIFF"
+
+              cat <<'EOF' > /tmp/post_to_slack.py
+              import os
+              import sys
+              from slack_sdk import WebClient
+              from slack_sdk.errors import SlackApiError
+
+              SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+              DIFF_CONTENT = os.getenv("DIFF_CONTENT", "No diff info")
+              APP_NAME = os.getenv("APP_NAME", "unknown-app")
+              MSG_METADATA = os.getenv("MSG_METADATA")
+
+              if not MSG_METADATA:
+                  print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
+                  sys.exit(1)
+
+              client = WebClient(token=SLACK_BOT_TOKEN)
+              channel_name = "#argocd"
+
+              try:
+                  response = client.chat_postMessage(
+                      channel=channel_name,
+                      text=f"Deployment pending approval for - *{APP_NAME}*:slack:\nDiff:\n```{DIFF_CONTENT[:5000]}```",
+                      blocks=[
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": f"Deployment pending approval for - *{APP_NAME}*:slack:\nDiff:\n```{DIFF_CONTENT[:5000]}```"
+                              }
+                          },
+                          {
+                              "type": "actions",
+                              "elements": [
+                                  {
+                                      "type": "button",
+                                      "text": {"type": "plain_text", "text": "Approve"},
+                                      "value": "approve_value",
+                                      "action_id": "approve_button"
+                                  },
+                                  {
+                                      "type": "button",
+                                      "text": {"type": "plain_text", "text": "Reject"},
+                                      "value": "reject_value",
+                                      "action_id": "reject_button"
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  channel_id = response["channel"]
+                  ts = response["ts"]
+
+                  with open(MSG_METADATA, "w") as f:
+                      f.write(f"{channel_id}||{ts}")
+
+                  print(f"[INFO] Slack message posted. channel_id={channel_id}, ts={ts}")
+              except SlackApiError as e:
+                  print(f"[ERROR] Slack post failed: {e.response['error']}", file=sys.stderr)
+                  sys.exit(1)
+              EOF
+
+              python3 /tmp/post_to_slack.py
+
+              TIMEOUT=600
+              SECS=0
+              echo "[INFO] Now monitoring $SIGNAL_FILE for 'approve' or 'reject'..."
+
+              while [ $SECS -lt $TIMEOUT ]; do
+                if [ -f "$SIGNAL_FILE" ]; then
+                  VAL=$(cat "$SIGNAL_FILE" | tr '[:upper:]' '[:lower:]')
+                  if [ "$VAL" = "approve" ]; then
+                    echo "[INFO] => APPROVED! Exiting 0 => ArgoCD continues."
+                    exit 0
+                  elif [ "$VAL" = "reject" ]; then
+                    echo "[INFO] => REJECTED! Terminating the ArgoCD operation..."
+                    argocd app terminate-op "$APP_NAME" --insecure --grpc-web
+                    exit 1
+                  else
+                    echo "[WARN] Unrecognized signal '$VAL'; ignoring..."
+                  fi
+                fi
+                echo "[INFO] $(date) => Waiting for Slack approval... ($SECS seconds elapsed)"
+                sleep 5
+                SECS=$((SECS+5))
+              done
+
+              echo "[INFO] TIMEOUT! No Slack response => Cancelling the ArgoCD operation..."
+              argocd app terminate-op "$APP_NAME" --insecure --grpc-web
+
+              cat <<'UPDATETIMEOUT' > /tmp/update_slack_timeout.py
+              import os
+              import sys
+              from slack_sdk import WebClient
+              from slack_sdk.errors import SlackApiError
+
+              SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+              APP_NAME = os.getenv("APP_NAME", "unknown-app")
+              MSG_METADATA = os.getenv("MSG_METADATA")
+
+              if not MSG_METADATA:
+                  print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
+                  sys.exit(1)
+
+              client = WebClient(token=SLACK_BOT_TOKEN)
+
+              if not os.path.exists(MSG_METADATA):
+                  print(f"[ERROR] Missing {MSG_METADATA} for Slack channel/ts", file=sys.stderr)
+                  sys.exit(1)
+
+              with open(MSG_METADATA, "r") as f:
+                  line = f.read().strip()
+
+              try:
+                  channel_id, original_ts = line.split("||", 1)
+              except ValueError:
+                  print("[ERROR] Could not parse channel/ts from msg_metadata", file=sys.stderr)
+                  sys.exit(1)
+
+              try:
+                  client.chat_update(
+                      channel=channel_id,
+                      ts=original_ts,
+                      text=f"Deployment approval for *{APP_NAME}* has *timed out*. Cancelling...",
+                      blocks=[]
+                  )
+                  print("[INFO] Timeout Slack message updated (same message).")
+              except SlackApiError as e:
+                  print(f"[ERROR] {e.response['error']}", file=sys.stderr)
+                  sys.exit(1)
+              UPDATETIMEOUT
+
+              python3 /tmp/update_slack_timeout.py
+
+              echo "[INFO] Removing leftover files: /tmp/presync/$APP_NAME ..."
+              rm -rf "/tmp/presync/$APP_NAME"
+
+              echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
+              exit 1
+{{- end }}
+
