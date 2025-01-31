@@ -70,7 +70,8 @@ spec:
               echo "$DIFF" > "$DIFF_FILE"
               echo "[INFO] Diff saved to $DIFF_FILE"
 
-              # Python script to reorder Slack blocks: Approve/Reject first, then diff
+              # Python script: Step 1) Upload diff to Slack in one message
+              #                Step 2) Post another message with Approve/Reject.
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
@@ -90,47 +91,49 @@ spec:
                   print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
                   sys.exit(1)
 
-              channel_id = "C087P4N117X"  # Replace with your Slack channel ID
+              # This is the channel name. If you're not joined, you need chat:write.public or
+              # to invite the bot. If it's private, you must invite the bot, or you'll get channel_not_found.
+              channel_name = "#argo-cd"
 
               client = WebClient(token=SLACK_BOT_TOKEN)
 
-              # Read entire diff
-              with open(DIFF_FILE, "r") as f:
-                  diff_content = f.read()
-
-              # Optional: Truncate the inline diff if it's large (Slack has block text limits)
-              TRUNC_LIMIT = 3000
-              truncated_diff = diff_content[:TRUNC_LIMIT]
-              if len(diff_content) > TRUNC_LIMIT:
-                  truncated_diff += "\n[... Diff truncated ...]"
-
               try:
-                  # 1) Upload the full diff file to Slack
-                  upload_response = client.files_upload_v2(
-                      channel=channel_id,
+                  # STEP 1: Upload the diff file in a single message
+                  # We won't do advanced block usage here, just a plain text + file upload
+                  file_upload = client.files_upload_v2(
+                      channel=channel_name,
                       file=DIFF_FILE,
                       title=f"Diff for {APP_NAME}",
                       filename=f"diff-{APP_NAME}.txt",
-                      initial_comment=f"Diff file for {APP_NAME}"
+                      initial_comment=f"Here is the diff for {APP_NAME}"
                   )
-
-                  files_list = upload_response.get("files", [])
+                  # If you want to see the file ID or permalink, you can retrieve them:
+                  files_list = file_upload.get("files", [])
                   if not files_list:
                       print("[ERROR] Slack upload returned no files.", file=sys.stderr)
                       sys.exit(1)
 
                   file_id = files_list[0]["id"]
-                  # 2) Grab permalink so we can reference the full diff
+                  # Retrieve the file's permalink to reference if needed
                   file_info = client.files_info(file=file_id)
                   file_link = file_info["file"]["permalink"]
 
-                  # 3) Post the interactive message
-                  # The top section: Approve/Reject Buttons
-                  # Then a second section with the truncated diff
+                  # STEP 2: Post a NEW message with Approve/Reject buttons
+                  # We'll do some short text referencing the file above.
                   response = client.chat_postMessage(
-                      channel=channel_id,
-                      text=f"Deployment pending approval for *{APP_NAME}*",
+                      channel=channel_name,
+                      text=f"Deployment pending approval for {APP_NAME}. Please approve or reject.",
                       blocks=[
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": (
+                                      f"Deployment pending approval for *{APP_NAME}*.\n"
+                                      f"Please check the diff file uploaded above in this channel ( <{file_link}|View Full Diff> )."
+                                  )
+                              }
+                          },
                           {
                               "type": "actions",
                               "elements": [
@@ -147,35 +150,25 @@ spec:
                                       "action_id": "reject_button"
                                   }
                               ]
-                          },
-                          {
-                              "type": "section",
-                              "text": {
-                                  "type": "mrkdwn",
-                                  "text": (
-                                      f"*Diff (truncated)*:\n```{truncated_diff}```\n\n"
-                                      f"Full diff file: <{file_link}|View Full Diff>"
-                                  )
-                              }
                           }
                       ]
                   )
 
-                  posted_channel = response["channel"]
-                  posted_ts = response["ts"]
+                  new_channel = response["channel"]
+                  new_ts = response["ts"]
 
-                  # 4) Store channel + ts for updating later
+                  # We'll store that in MSG_METADATA so we can update the message on timeout or log approvals
                   with open(MSG_METADATA, "w") as f:
-                      f.write(f"{posted_channel}||{posted_ts}")
+                      f.write(f"{new_channel}||{new_ts}")
 
-                  print(f"[INFO] Slack message posted successfully. channel_id={posted_channel}, ts={posted_ts}")
+                  print(f"[INFO] Slack message posted successfully to {channel_name}. channel_id={new_channel}, ts={new_ts}")
 
               except SlackApiError as e:
                   print(f"[ERROR] Slack post failed: {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
               EOF
 
-              echo "[INFO] Posting to Slack..."
+              echo "[INFO] Posting to Slack (two messages)..."
               python3 /tmp/post_to_slack.py
 
               echo "[INFO] Waiting for Slack approval/rejection..."
@@ -216,6 +209,7 @@ spec:
               if not MSG_METADATA:
                   print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
                   sys.exit(1)
+
               if not os.path.exists(MSG_METADATA):
                   print(f"[ERROR] Missing {MSG_METADATA} for Slack channel/ts", file=sys.stderr)
                   sys.exit(1)
@@ -251,6 +245,7 @@ spec:
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
 {{- end }}
+
 
 
 
