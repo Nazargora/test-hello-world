@@ -45,7 +45,7 @@ spec:
 
               source /opt/venv/bin/activate  
 
-              echo "Logging in to Argo CD server..."
+              echo "[INFO] Logging in to Argo CD server..."
               argocd login argocd-stone.demoapps.win \
                 --username test \
                 --password "$ARGOCD_PASSWORD" \
@@ -57,69 +57,81 @@ spec:
               SIGNAL_FILE="/tmp/presync/$APP_NAME/approval_signal"
               EMAILS_FILE="/tmp/presync/$APP_NAME/approved_emails"
               MSG_METADATA="/tmp/presync/$APP_NAME/msg_metadata"
-              export SIGNAL_FILE
-              export EMAILS_FILE
-              export MSG_METADATA
+              export SIGNAL_FILE EMAILS_FILE MSG_METADATA
 
               if [ -z "$MSG_METADATA" ]; then
                 echo "[ERROR] MSG_METADATA environment variable is not set!"
                 exit 1
               fi
 
-              echo "[INFO] SIGNAL_FILE => $SIGNAL_FILE"
-              echo "[INFO] EMAILS_FILE => $EMAILS_FILE"
-              echo "[INFO] MSG_METADATA => $MSG_METADATA"
-
+              echo "[INFO] Generating DIFF..."
               DIFF=$(argocd app diff "$APP_NAME" --refresh --exit-code=false || true)
-              echo "[INFO] DIFF output:"
-              echo "$DIFF"
-              export DIFF_CONTENT="$DIFF"
+              DIFF_FILE="/tmp/presync/$APP_NAME/diff.txt"
+              echo "$DIFF" > "$DIFF_FILE"
+              echo "[INFO] Diff saved to $DIFF_FILE"
 
+              # Python: перша частина - file_upload через ID каналу,
+              # друга частина - окреме повідомлення з кнопками через ім’я каналу (#argo-cd).
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
               from slack_sdk import WebClient
               from slack_sdk.errors import SlackApiError
-              
+
               SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-              DIFF_CONTENT = os.getenv("DIFF_CONTENT", "No diff info")
               APP_NAME = os.getenv("APP_NAME", "unknown-app")
               MSG_METADATA = os.getenv("MSG_METADATA")
-              
-              if not MSG_METADATA:
-                  print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
+              DIFF_FILE = f"/tmp/presync/{APP_NAME}/diff.txt"
+
+              if not os.path.isfile(DIFF_FILE):
+                  print(f"[ERROR] Diff file not found: {DIFF_FILE}", file=sys.stderr)
                   sys.exit(1)
-              
+
+              if not MSG_METADATA:
+                  print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
+                  sys.exit(1)
+
+              # 1. Канал як ID для завантаження файлу (наприклад, C087P4N117X)
+              channel_id_for_file = "C087P4N117X"
+              # 2. Канал як ім’я (для кнопок)
+              channel_name_for_buttons = "#argo-cd"
+
               client = WebClient(token=SLACK_BOT_TOKEN)
-              channel_id = "C087P4N117X"  # Використовуємо Channel ID замість назви
-              
+
               try:
-                  # 1) Вантажимо DIFF як файл, якщо DIFF не порожній
-                  if DIFF_CONTENT.strip():
-                      try:
-                          file_upload_response = client.files_upload_v2(
-                              channel=channel_id,
-                              content=DIFF_CONTENT,
-                              filename="argocd_diff.txt",
-                              title=f"Diff for {APP_NAME}",
-                              initial_comment=f"Here is the diff for {APP_NAME}",
-                              snippet_type="text"
-                          )
-                          print(f"[INFO] Slack file uploaded (v2). File ID: {file_upload_response['file']['id']}")
-                      except SlackApiError as e:
-                          print(f"[ERROR] Slack file upload failed: {e.response['error']}", file=sys.stderr)
-                          sys.exit(1)
-              
-                  # 2) Відправляємо основне повідомлення із кнопками "Approve" / "Reject"
+                  # === STEP 1: Завантажити файл через ID каналу ===
+                  upload_response = client.files_upload_v2(
+                      channel=channel_id_for_file,
+                      file=DIFF_FILE,
+                      title=f"Diff for {APP_NAME}",
+                      filename=f"diff-{APP_NAME}.txt",
+                      initial_comment=f"Here is the diff for {APP_NAME} (uploaded via channel ID)."
+                  )
+                  files_list = upload_response.get("files", [])
+                  if not files_list:
+                      print("[ERROR] Slack upload returned no files.", file=sys.stderr)
+                      sys.exit(1)
+
+                  # Якщо треба permalink, беремо file_id
+                  file_id = files_list[0]["id"]
+                  file_info = client.files_info(file=file_id)
+                  file_link = file_info["file"]["permalink"]
+
+                  print("[INFO] Diff file uploaded successfully via channel ID.")
+
+                  # === STEP 2: Відправити НОВЕ повідомлення з кнопками, використовуючи ім’я каналу ===
                   response = client.chat_postMessage(
-                      channel=channel_id,
-                      text=f"Deployment pending approval for - *{APP_NAME}*",
+                      channel=channel_name_for_buttons,  # тут уже "#argo-cd"
+                      text=f"Deployment pending approval for {APP_NAME}. Please approve or reject.",
                       blocks=[
                           {
                               "type": "section",
                               "text": {
                                   "type": "mrkdwn",
-                                  "text": f"Deployment pending approval for - *{APP_NAME}*\n:slack:\n\n*Diff attached as file above.*"
+                                  "text": (
+                                      f"Deployment pending approval for *{APP_NAME}*.\n"
+                                      f"Diff file uploaded above:\n<{file_link}|View Full Diff>"
+                                  )
                               }
                           },
                           {
@@ -141,28 +153,27 @@ spec:
                           }
                       ]
                   )
-              
-                  # Зберігаємо channel/ts, щоб у майбутньому оновлювати/редагувати те саме повідомлення
-                  channel_out = response["channel"]
-                  ts_out = response["ts"]
-              
+
+                  msg_channel = response["channel"]
+                  msg_ts = response["ts"]
+
+                  # Зберігаємо channel+ts у MSG_METADATA, щоб змінити/оновити повідомлення пізніше
                   with open(MSG_METADATA, "w") as f:
-                      f.write(f"{channel_out}||{ts_out}")
-              
-                  print(f"[INFO] Slack message posted. channel_id={channel_out}, ts={ts_out}")
-              
+                      f.write(f"{msg_channel}||{msg_ts}")
+
+                  print(f"[INFO] Slack message with Approve/Reject posted to {channel_name_for_buttons}. channel_id={msg_channel}, ts={msg_ts}")
+
               except SlackApiError as e:
                   print(f"[ERROR] Slack post failed: {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
               EOF
 
-              #
-              # Далі логіка чекаємо 10 хв (600 сек) на файл $SIGNAL_FILE
-              #
-              TIMEOUT=60
-              SECS=0
-              echo "[INFO] Now monitoring $SIGNAL_FILE for 'approve' or 'reject'..."
+              echo "[INFO] Posting to Slack (two-part logic: file ID + channel name for buttons)..."
+              python3 /tmp/post_to_slack.py
 
+              echo "[INFO] Waiting for Slack approval/rejection..."
+              TIMEOUT=100
+              SECS=0
               while [ $SECS -lt $TIMEOUT ]; do
                 if [ -f "$SIGNAL_FILE" ]; then
                   VAL=$(cat "$SIGNAL_FILE" | tr '[:upper:]' '[:lower:]')
@@ -173,11 +184,11 @@ spec:
                     echo "[INFO] => REJECTED! Terminating the ArgoCD operation..."
                     argocd app terminate-op "$APP_NAME" --insecure --grpc-web
                     exit 1
-                  else
+                  else:
                     echo "[WARN] Unrecognized signal '$VAL'; ignoring..."
                   fi
                 fi
-                echo "[INFO] $(date) => Waiting for Slack approval... ($SECS seconds elapsed)"
+                echo "[INFO] $(date) => Still waiting for Slack approval... ($SECS seconds elapsed)"
                 sleep 5
                 SECS=$((SECS+5))
               done
@@ -185,38 +196,34 @@ spec:
               echo "[INFO] TIMEOUT! No Slack response => Cancelling the ArgoCD operation..."
               argocd app terminate-op "$APP_NAME" --insecure --grpc-web
 
-              #
-              # Оновлюємо повідомлення у Slack про те, що час вийшов
-              #
               cat <<'UPDATETIMEOUT' > /tmp/update_slack_timeout.py
               import os
               import sys
               from slack_sdk import WebClient
               from slack_sdk.errors import SlackApiError
-              
+
               SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
               APP_NAME = os.getenv("APP_NAME", "unknown-app")
               MSG_METADATA = os.getenv("MSG_METADATA")
-              
+
               if not MSG_METADATA:
                   print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
                   sys.exit(1)
-              
-              client = WebClient(token=SLACK_BOT_TOKEN)
-              
+
               if not os.path.exists(MSG_METADATA):
                   print(f"[ERROR] Missing {MSG_METADATA} for Slack channel/ts", file=sys.stderr)
                   sys.exit(1)
-              
+
+              client = WebClient(token=SLACK_BOT_TOKEN)
+
               with open(MSG_METADATA, "r") as f:
                   line = f.read().strip()
-              
               try:
                   channel_id, original_ts = line.split("||", 1)
               except ValueError:
                   print("[ERROR] Could not parse channel/ts from msg_metadata", file=sys.stderr)
                   sys.exit(1)
-              
+
               try:
                   client.chat_update(
                       channel=channel_id,
@@ -224,7 +231,7 @@ spec:
                       text=f"Deployment approval for *{APP_NAME}* has *timed out*. Cancelling...",
                       blocks=[]
                   )
-                  print("[INFO] Timeout Slack message updated (same message).")
+                  print("[INFO] Timeout Slack message updated.")
               except SlackApiError as e:
                   print(f"[ERROR] {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
@@ -237,7 +244,8 @@ spec:
 
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
-  {{- end }}
+{{- end }}
+
 
 
 
