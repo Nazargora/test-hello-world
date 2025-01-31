@@ -52,32 +52,26 @@ spec:
                 --insecure \
                 --grpc-web
 
-              # Prepare directory for storing data
               mkdir -p "/tmp/presync/$APP_NAME"
 
-              # Export file paths as environment variables for convenience
               SIGNAL_FILE="/tmp/presync/$APP_NAME/approval_signal"
               EMAILS_FILE="/tmp/presync/$APP_NAME/approved_emails"
               MSG_METADATA="/tmp/presync/$APP_NAME/msg_metadata"
-              export SIGNAL_FILE
-              export EMAILS_FILE
-              export MSG_METADATA
+              export SIGNAL_FILE EMAILS_FILE MSG_METADATA
 
               if [ -z "$MSG_METADATA" ]; then
                 echo "[ERROR] MSG_METADATA environment variable is not set!"
                 exit 1
               fi
 
-              echo "[INFO] SIGNAL_FILE => $SIGNAL_FILE"
-              echo "[INFO] EMAILS_FILE => $EMAILS_FILE"
-              echo "[INFO] MSG_METADATA => $MSG_METADATA"
-
-              # Get Argo CD diff
+              # Generate the diff and save to file
+              echo "[INFO] Generating DIFF..."
               DIFF=$(argocd app diff "$APP_NAME" --refresh --exit-code=false || true)
-              echo "[INFO] Saving DIFF output to file..."
               DIFF_FILE="/tmp/presync/$APP_NAME/diff.txt"
               echo "$DIFF" > "$DIFF_FILE"
+              echo "[INFO] Diff saved to $DIFF_FILE"
 
+              # Python script to upload the diff using files_upload_v2 and post approval message
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
@@ -87,34 +81,54 @@ spec:
               SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
               APP_NAME = os.getenv("APP_NAME", "unknown-app")
               MSG_METADATA = os.getenv("MSG_METADATA")
+
               DIFF_FILE = f"/tmp/presync/{APP_NAME}/diff.txt"
+              if not os.path.isfile(DIFF_FILE):
+                  print(f"[ERROR] Diff file not found: {DIFF_FILE}", file=sys.stderr)
+                  sys.exit(1)
 
               if not MSG_METADATA:
-                  print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
+                  print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
                   sys.exit(1)
 
               client = WebClient(token=SLACK_BOT_TOKEN)
               channel_name = "#argo-cd"
 
               try:
-                  # 1) Upload the diff file
-                  upload_response = client.files_upload(
-                      channels=channel_name,
+                  # 1) Upload the diff file using files_upload_v2
+                  upload_response = client.files_upload_v2(
+                      channels=[channel_name],
                       file=DIFF_FILE,
-                      title=f"Diff for {APP_NAME}"
+                      title=f"Diff for {APP_NAME}",
+                      filename=f"diff-{APP_NAME}.txt",
+                      initial_comment=f"Diff file for {APP_NAME}"
                   )
-                  file_link = upload_response["file"]["permalink"]
 
-                  # 2) Post an approval message including the link to the diff file
+                  # files_upload_v2 response includes "files": [ { ... } ]
+                  files_list = upload_response.get("files", [])
+                  if not files_list:
+                      print("[ERROR] Slack upload returned no files.", file=sys.stderr)
+                      sys.exit(1)
+
+                  file_id = files_list[0]["id"]
+
+                  # 2) Retrieve the permalink via files_info
+                  file_info = client.files_info(file=file_id)
+                  file_link = file_info["file"]["permalink"]
+
+                  # 3) Post an approval message referencing the file
                   response = client.chat_postMessage(
                       channel=channel_name,
-                      text=f"Deployment pending approval for - *{APP_NAME}*\nDiff file: {file_link}",
+                      text=f"Deployment pending approval for *{APP_NAME}*\nDiff File: {file_link}",
                       blocks=[
                           {
                               "type": "section",
                               "text": {
                                   "type": "mrkdwn",
-                                  "text": f"Deployment pending approval for - *{APP_NAME}*\n\nA diff file has been uploaded:\n<{file_link}|View Diff>"
+                                  "text": (
+                                      f"Deployment pending approval for *{APP_NAME}*.\n"
+                                      f"A diff file has been uploaded:\n<{file_link}|View Diff>"
+                                  )
                               }
                           },
                           {
@@ -139,24 +153,24 @@ spec:
                   channel_id = response["channel"]
                   ts = response["ts"]
 
-                  # Store channel_id and ts to msg_metadata
+                  # Write channel_id + ts to msg_metadata
                   with open(MSG_METADATA, "w") as f:
                       f.write(f"{channel_id}||{ts}")
 
                   print(f"[INFO] Slack message posted. channel_id={channel_id}, ts={ts}")
+
               except SlackApiError as e:
                   print(f"[ERROR] Slack post failed: {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
               EOF
 
-              # Send Slack notification (with uploaded diff)
+              # Run the Slack posting script
               python3 /tmp/post_to_slack.py
 
-              # Wait for approval or rejection
-              TIMEOUT=600
+              # Wait for user to Approve or Reject
+              TIMEOUT=100
               SECS=0
-              echo "[INFO] Now monitoring $SIGNAL_FILE for 'approve' or 'reject'..."
-
+              echo "[INFO] Waiting for Slack approval/rejection..."
               while [ $SECS -lt $TIMEOUT ]; do
                 if [ -f "$SIGNAL_FILE" ]; then
                   VAL=$(cat "$SIGNAL_FILE" | tr '[:upper:]' '[:lower:]')
@@ -167,18 +181,20 @@ spec:
                     echo "[INFO] => REJECTED! Terminating the ArgoCD operation..."
                     argocd app terminate-op "$APP_NAME" --insecure --grpc-web
                     exit 1
-                  else:
+                  else
                     echo "[WARN] Unrecognized signal '$VAL'; ignoring..."
                   fi
                 fi
-                echo "[INFO] $(date) => Waiting for Slack approval... ($SECS seconds elapsed)"
+                echo "[INFO] $(date) => Still waiting for Slack approval... ($SECS seconds elapsed)"
                 sleep 5
                 SECS=$((SECS+5))
               done
 
+              # Timeout scenario
               echo "[INFO] TIMEOUT! No Slack response => Cancelling the ArgoCD operation..."
               argocd app terminate-op "$APP_NAME" --insecure --grpc-web
 
+              # Update Slack message to reflect timeout
               cat <<'UPDATETIMEOUT' > /tmp/update_slack_timeout.py
               import os
               import sys
@@ -193,15 +209,14 @@ spec:
                   print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
                   sys.exit(1)
 
-              client = WebClient(token=SLACK_BOT_TOKEN)
-
               if not os.path.exists(MSG_METADATA):
                   print(f"[ERROR] Missing {MSG_METADATA} for Slack channel/ts", file=sys.stderr)
                   sys.exit(1)
 
+              client = WebClient(token=SLACK_BOT_TOKEN)
+
               with open(MSG_METADATA, "r") as f:
                   line = f.read().strip()
-
               try:
                   channel_id, original_ts = line.split("||", 1)
               except ValueError:
@@ -215,7 +230,7 @@ spec:
                       text=f"Deployment approval for *{APP_NAME}* has *timed out*. Cancelling...",
                       blocks=[]
                   )
-                  print("[INFO] Timeout Slack message updated (same message).")
+                  print("[INFO] Timeout Slack message updated.")
               except SlackApiError as e:
                   print(f"[ERROR] {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
@@ -229,5 +244,6 @@ spec:
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
 {{- end }}
+
 
 
