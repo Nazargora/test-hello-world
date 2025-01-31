@@ -76,8 +76,7 @@ spec:
               export DIFF_CONTENT="$DIFF"
 
               #
-              # Замість колишнього вбудовування DIFF у текст повідомлення
-              # створюємо /tmp/post_to_slack.py зі зміненим кодом, який вантажить DIFF як файл
+              # Генеруємо /tmp/post_to_slack.py
               #
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
@@ -101,15 +100,15 @@ spec:
                   # 1) Вантажимо DIFF як файл, якщо DIFF не порожній
                   if DIFF_CONTENT.strip():
                       try:
-                          file_upload_response = client.files_upload(
-                              channels=channel_id,
+                          file_upload_response = client.files_upload_v2(
+                              channel=channel_id,
                               content=DIFF_CONTENT,
-                              filetype="text",
                               filename="argocd_diff.txt",
                               title=f"Diff for {APP_NAME}",
-                              initial_comment=f"Here is the diff for {APP_NAME}"
+                              initial_comment=f"Here is the diff for {APP_NAME}",
+                              snippet_type="text"
                           )
-                          print(f"[INFO] Slack file uploaded. File ID: {file_upload_response['file']['id']}")
+                          print(f"[INFO] Slack file uploaded (v2). File ID: {file_upload_response['file']['id']}")
                       except SlackApiError as e:
                           print(f"[ERROR] Slack file upload failed: {e.response['error']}", file=sys.stderr)
                           sys.exit(1)
@@ -146,7 +145,7 @@ spec:
                       ]
                   )
               
-                  # Зберігаємо channel/ts, щоб у майбутньому оновлювати / редагувати те саме повідомлення
+                  # Зберігаємо channel/ts, щоб у майбутньому оновлювати/редагувати те саме повідомлення
                   channel_out = response["channel"]
                   ts_out = response["ts"]
               
@@ -163,7 +162,6 @@ spec:
               #
               # Далі логіка чекаємо 10 хв (600 сек) на файл $SIGNAL_FILE
               #
-
               TIMEOUT=600
               SECS=0
               echo "[INFO] Now monitoring $SIGNAL_FILE for 'approve' or 'reject'..."
@@ -242,7 +240,8 @@ spec:
 
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
-{{- end }}
+  {{- end }}
+
 
 
 
