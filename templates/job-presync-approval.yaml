@@ -122,13 +122,15 @@ spec:
                                       "type": "button",
                                       "text": {"type": "plain_text", "text": "Approve"},
                                       "value": "approve_value",
-                                      "action_id": "approve_button"
+                                      "action_id": "approve_button",
+                                      "style": "primary"  # GREEN BUTTON
                                   },
                                   {
                                       "type": "button",
                                       "text": {"type": "plain_text", "text": "Reject"},
                                       "value": "reject_value",
-                                      "action_id": "reject_button"
+                                      "action_id": "reject_button",
+                                      "style": "danger"   # RED BUTTON
                                   }
                               ]
                           }
