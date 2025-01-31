@@ -103,14 +103,14 @@ spec:
               try:
                   approval_resp = client.chat_postMessage(
                       channel=channel_for_approval,
-                      text=f"Deployment pending approval for {APP_NAME}. Please approve or reject.",
+                      text=f"Deployment pending approval for - *{APP_NAME}*:slack:. Please approve or reject.",
                       blocks=[
                           {
                               "type": "section",
                               "text": {
                                   "type": "mrkdwn",
                                   "text": (
-                                      f"Deployment pending approval for *{APP_NAME}*.\n"
+                                      f"Deployment pending approval for  - *{APP_NAME}*:slack:.\n"
                                       "Please click *Approve* or *Reject* below."
                                   )
                               }
