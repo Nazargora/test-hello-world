@@ -162,7 +162,7 @@ spec:
               #
               # Далі логіка чекаємо 10 хв (600 сек) на файл $SIGNAL_FILE
               #
-              TIMEOUT=600
+              TIMEOUT=60
               SECS=0
               echo "[INFO] Now monitoring $SIGNAL_FILE for 'approve' or 'reject'..."
 
