@@ -75,9 +75,6 @@ spec:
               echo "$DIFF"
               export DIFF_CONTENT="$DIFF"
 
-              #
-              # Генеруємо /tmp/post_to_slack.py
-              #
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
