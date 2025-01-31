@@ -70,7 +70,7 @@ spec:
               echo "$DIFF" > "$DIFF_FILE"
               echo "[INFO] Diff saved to $DIFF_FILE"
 
-              # Python script to upload the diff file and post an interactive Slack message
+              # Python script to reorder Slack blocks: Approve/Reject first, then diff
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
@@ -90,26 +90,22 @@ spec:
                   print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
                   sys.exit(1)
 
-              # This is the channel ID from Slack (for example, C087P4N117X).
-              # Make sure your bot is invited to this channel if it's private,
-              # or has chat:write.public if it's a public channel.
-              channel_id = "C087P4N117X"
+              channel_id = "C087P4N117X"  # Replace with your Slack channel ID
 
               client = WebClient(token=SLACK_BOT_TOKEN)
 
-              # Read the entire diff
+              # Read entire diff
               with open(DIFF_FILE, "r") as f:
                   diff_content = f.read()
 
-              # Slack has a limit (~3000-4000 chars) for block text, so let's truncate if it's huge.
-              # Adjust this limit as you prefer.
+              # Optional: Truncate the inline diff if it's large (Slack has block text limits)
               TRUNC_LIMIT = 3000
               truncated_diff = diff_content[:TRUNC_LIMIT]
               if len(diff_content) > TRUNC_LIMIT:
                   truncated_diff += "\n[... Diff truncated ...]"
 
               try:
-                  # 1) Upload the diff file to Slack
+                  # 1) Upload the full diff file to Slack
                   upload_response = client.files_upload_v2(
                       channel=channel_id,
                       file=DIFF_FILE,
@@ -117,33 +113,24 @@ spec:
                       filename=f"diff-{APP_NAME}.txt",
                       initial_comment=f"Diff file for {APP_NAME}"
                   )
+
                   files_list = upload_response.get("files", [])
                   if not files_list:
                       print("[ERROR] Slack upload returned no files.", file=sys.stderr)
                       sys.exit(1)
 
                   file_id = files_list[0]["id"]
-
-                  # 2) Retrieve the file's permalink
+                  # 2) Grab permalink so we can reference the full diff
                   file_info = client.files_info(file=file_id)
                   file_link = file_info["file"]["permalink"]
 
-                  # 3) Post a message with the truncated diff + Approve/Reject buttons
+                  # 3) Post the interactive message
+                  # The top section: Approve/Reject Buttons
+                  # Then a second section with the truncated diff
                   response = client.chat_postMessage(
                       channel=channel_id,
                       text=f"Deployment pending approval for *{APP_NAME}*",
                       blocks=[
-                          {
-                              "type": "section",
-                              "text": {
-                                  "type": "mrkdwn",
-                                  "text": (
-                                      f"Deployment pending approval for *{APP_NAME}*.\n\n"
-                                      f"*Inline Diff (truncated)*:\n```{truncated_diff}```\n\n"
-                                      f"Full diff file: <{file_link}|View Full Diff>"
-                                  )
-                              }
-                          },
                           {
                               "type": "actions",
                               "elements": [
@@ -160,13 +147,24 @@ spec:
                                       "action_id": "reject_button"
                                   }
                               ]
+                          },
+                          {
+                              "type": "section",
+                              "text": {
+                                  "type": "mrkdwn",
+                                  "text": (
+                                      f"*Diff (truncated)*:\n```{truncated_diff}```\n\n"
+                                      f"Full diff file: <{file_link}|View Full Diff>"
+                                  )
+                              }
                           }
                       ]
                   )
+
                   posted_channel = response["channel"]
                   posted_ts = response["ts"]
 
-                  # 4) Store channel/ts so we can update or terminate later
+                  # 4) Store channel + ts for updating later
                   with open(MSG_METADATA, "w") as f:
                       f.write(f"{posted_channel}||{posted_ts}")
 
@@ -193,7 +191,7 @@ spec:
                     echo "[INFO] => REJECTED! Terminating the ArgoCD operation..."
                     argocd app terminate-op "$APP_NAME" --insecure --grpc-web
                     exit 1
-                  else
+                  else:
                     echo "[WARN] Unrecognized signal '$VAL'; ignoring..."
                   fi
                 fi
@@ -218,7 +216,6 @@ spec:
               if not MSG_METADATA:
                   print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
                   sys.exit(1)
-
               if not os.path.exists(MSG_METADATA):
                   print(f"[ERROR] Missing {MSG_METADATA} for Slack channel/ts", file=sys.stderr)
                   sys.exit(1)
@@ -227,7 +224,6 @@ spec:
 
               with open(MSG_METADATA, "r") as f:
                   line = f.read().strip()
-
               try:
                   channel_id, original_ts = line.split("||", 1)
               except ValueError:
@@ -255,6 +251,7 @@ spec:
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
 {{- end }}
+
 
 
 
