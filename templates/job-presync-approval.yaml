@@ -70,8 +70,7 @@ spec:
               echo "$DIFF" > "$DIFF_FILE"
               echo "[INFO] Diff saved to $DIFF_FILE"
 
-              # Python: перша частина - file_upload через ID каналу,
-              # друга частина - окреме повідомлення з кнопками через ім’я каналу (#argo-cd).
+              # Python script with two separate try: blocks
               cat <<'EOF' > /tmp/post_to_slack.py
               import os
               import sys
@@ -91,37 +90,19 @@ spec:
                   print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
                   sys.exit(1)
 
-              # 1. Канал як ID для завантаження файлу (наприклад, C087P4N117X)
-              channel_id_for_file = "C087P4N117X"
-              # 2. Канал як ім’я (для кнопок)
-              channel_name_for_buttons = "#argo-cd"
+              # Example channel name or ID. If using a private channel, invite the bot first.
+              channel_for_approval = "#argo-cd"  
+              channel_for_diff = "#argo-cd"     
 
               client = WebClient(token=SLACK_BOT_TOKEN)
 
+              posted_channel_id = None
+              posted_ts = None
+
+              # ========== STEP 1: POST APPROVE/REJECT MESSAGE ==========
               try:
-                  # === STEP 1: Завантажити файл через ID каналу ===
-                  upload_response = client.files_upload_v2(
-                      channel=channel_id_for_file,
-                      file=DIFF_FILE,
-                      title=f"Diff for {APP_NAME}",
-                      filename=f"diff-{APP_NAME}.txt",
-                      initial_comment=f"Here is the diff for {APP_NAME} (uploaded via channel ID)."
-                  )
-                  files_list = upload_response.get("files", [])
-                  if not files_list:
-                      print("[ERROR] Slack upload returned no files.", file=sys.stderr)
-                      sys.exit(1)
-
-                  # Якщо треба permalink, беремо file_id
-                  file_id = files_list[0]["id"]
-                  file_info = client.files_info(file=file_id)
-                  file_link = file_info["file"]["permalink"]
-
-                  print("[INFO] Diff file uploaded successfully via channel ID.")
-
-                  # === STEP 2: Відправити НОВЕ повідомлення з кнопками, використовуючи ім’я каналу ===
-                  response = client.chat_postMessage(
-                      channel=channel_name_for_buttons,  # тут уже "#argo-cd"
+                  approval_resp = client.chat_postMessage(
+                      channel=channel_for_approval,
                       text=f"Deployment pending approval for {APP_NAME}. Please approve or reject.",
                       blocks=[
                           {
@@ -130,7 +111,7 @@ spec:
                                   "type": "mrkdwn",
                                   "text": (
                                       f"Deployment pending approval for *{APP_NAME}*.\n"
-                                      f"Diff file uploaded above:\n<{file_link}|View Full Diff>"
+                                      "Please click *Approve* or *Reject* below."
                                   )
                               }
                           },
@@ -153,22 +134,45 @@ spec:
                           }
                       ]
                   )
+                  posted_channel_id = approval_resp["channel"]
+                  posted_ts = approval_resp["ts"]
 
-                  msg_channel = response["channel"]
-                  msg_ts = response["ts"]
-
-                  # Зберігаємо channel+ts у MSG_METADATA, щоб змінити/оновити повідомлення пізніше
+                  # Save channel+ts to MSG_METADATA
                   with open(MSG_METADATA, "w") as f:
-                      f.write(f"{msg_channel}||{msg_ts}")
+                      f.write(f"{posted_channel_id}||{posted_ts}")
 
-                  print(f"[INFO] Slack message with Approve/Reject posted to {channel_name_for_buttons}. channel_id={msg_channel}, ts={msg_ts}")
+                  print(f"[INFO] Slack approval message posted to {channel_for_approval}. channel_id={posted_channel_id}, ts={posted_ts}")
 
               except SlackApiError as e:
-                  print(f"[ERROR] Slack post failed: {e.response['error']}", file=sys.stderr)
+                  print(f"[ERROR] chat_postMessage failed: {e.response['error']}", file=sys.stderr)
+                  sys.exit(1)
+
+              # ========== STEP 2: UPLOAD DIFF FILE IN A SECOND MESSAGE ==========
+              try:
+                  upload_resp = client.files_upload_v2(
+                      channel=channel_for_diff,
+                      file=DIFF_FILE,
+                      title=f"Diff for {APP_NAME}",
+                      filename=f"diff-{APP_NAME}.txt",
+                      initial_comment=f"Here is the diff for {APP_NAME} (sent as a separate message)."
+                  )
+                  files_list = upload_resp.get("files", [])
+                  if not files_list:
+                      print("[ERROR] Slack upload returned no files.", file=sys.stderr)
+                      sys.exit(1)
+
+                  file_id = files_list[0]["id"]
+                  file_info = client.files_info(file=file_id)
+                  file_link = file_info["file"]["permalink"]
+
+                  print(f"[INFO] Diff file uploaded to {channel_for_diff}: {file_link}")
+
+              except SlackApiError as e:
+                  print(f"[ERROR] files_upload_v2 failed: {e.response['error']}", file=sys.stderr)
                   sys.exit(1)
               EOF
 
-              echo "[INFO] Posting to Slack (two-part logic: file ID + channel name for buttons)..."
+              echo "[INFO] Sending Slack messages in two separate steps..."
               python3 /tmp/post_to_slack.py
 
               echo "[INFO] Waiting for Slack approval/rejection..."
@@ -196,6 +200,7 @@ spec:
               echo "[INFO] TIMEOUT! No Slack response => Cancelling the ArgoCD operation..."
               argocd app terminate-op "$APP_NAME" --insecure --grpc-web
 
+              # On timeout, update the Approve/Reject message to reflect cancellation
               cat <<'UPDATETIMEOUT' > /tmp/update_slack_timeout.py
               import os
               import sys
@@ -207,7 +212,7 @@ spec:
               MSG_METADATA = os.getenv("MSG_METADATA")
 
               if not MSG_METADATA:
-                  print("[ERROR] MSG_METADATA is not set in the environment!", file=sys.stderr)
+                  print("[ERROR] MSG_METADATA is not set!", file=sys.stderr)
                   sys.exit(1)
 
               if not os.path.exists(MSG_METADATA):
@@ -245,6 +250,7 @@ spec:
               echo "[INFO] Exiting with code 1 => Argo sees hook as failed."
               exit 1
 {{- end }}
+
 
 
 
