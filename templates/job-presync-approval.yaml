@@ -92,7 +92,7 @@ spec:
 
               # Example channel name or ID. If using a private channel, invite the bot first.
               channel_for_approval = "#argo-cd"  
-              channel_for_diff = "#argo-cd"     
+              channel_for_diff = "C087P4N117X"     
 
               client = WebClient(token=SLACK_BOT_TOKEN)
 
