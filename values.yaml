@@ -26,5 +26,4 @@ service:
   type: ClusterIP
   port: 8080
 
-argocd:
-  enabled: false
+
