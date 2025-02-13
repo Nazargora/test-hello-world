@@ -1,0 +1,3 @@
+[submodule "presync-submodule"]
+	path = presync-submodule
+	url = https://github.com/Nazargora/submodels-tie-test-hello-world.git
